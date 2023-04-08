@@ -553,34 +553,13 @@ static void quantize_row_q4_0_reference(const float * restrict x, block_q4_0 * r
     }
 }
 
-static int comparefloat(const void * f1p, const void * f2p) {
-    float f1 = *(const float *) f1p;
-    float f2 = *(const float *) f2p;
-    return (f1 > f2) - (f1 < f2);
-}
-
 // Each event represents a value of d where one value in x changes its quantization
 typedef struct scale_change_event {
     float d;
     uint8_t x_i;
-    uint8_t new_qi;
+    int8_t new_qi;
 } scale_change_event_t;
 
-
-// Move an inserted leaf element up the heap until the heap property is restored
-static void heap_percolate_up(struct scale_change_event * restrict heap, size_t i) {
-    while (i > 1) {
-        const size_t parent_i = i / 2;
-        if (heap[parent_i].d <= heap[i].d) {
-            break;
-        }
-        // Swap with parent
-        struct scale_change_event tmp = heap[i];
-        heap[i] = heap[parent_i];
-        heap[parent_i] = tmp;
-        i = parent_i;
-    }
-}
 
 // Move an inserted root element down until the heap property is restored
 static void heap_percolate_down(struct scale_change_event * restrict heap, size_t heap_size, size_t i) {
@@ -633,8 +612,8 @@ static float find_optimal_scale(const float * restrict x, uint8_t * restrict qi)
     };
 
     // Each input value will go through each of the 16 quantization values
-    // This is a heap starting at index 1
-    struct scale_change_event events[16*QK+1];
+    // This is a heap starting at index 1, storing the next change position for each value
+    struct scale_change_event events[QK+1];
     // element 0 is unused - silence compiler warning
     events[0] = (struct scale_change_event) {0};
     int nevents = 0;
@@ -643,21 +622,11 @@ static float find_optimal_scale(const float * restrict x, uint8_t * restrict qi)
             // We ignore the scaling of zero valued elements
             continue;
         }
-        for (int j = 0; j < 15; j++) {
-            // Positive valued elements sweep backwards from zero, negative elements sweep forward from zero,
-            // both will wrap around and end up back at zero
-            int forwardi = (x[i] > 0) ? j : j+1;
-            events[1 + nevents++] = (struct scale_change_event) {
-                .d      = x[i] * inv_midpoints[j],
-                .x_i    = i,
-                .new_qi = forwardi,
-            };
-        }
-        // Add a wrap-around event at 0
+        int forwardi = (x[i] > 0) ? zero_i-1 : zero_i+1;
         events[1 + nevents++] = (struct scale_change_event) {
-            .d      = 0,
+            .d      = x[i] * inv_midpoints[(x[i] > 0 ) ? zero_i-1 : zero_i],
             .x_i    = i,
-            .new_qi = (x[i] > 0) ? 15 : 0
+            .new_qi = forwardi,
         };
     }
 
@@ -680,8 +649,46 @@ static float find_optimal_scale(const float * restrict x, uint8_t * restrict qi)
 
     while (nevents) {
         struct scale_change_event ev = events[1];
-        // Pop element off heap
-        events[1] = events[nevents--];
+        if (ev.new_qi == zero_i) {
+            // Last one, pop element off heap
+            events[1] = events[nevents--];
+        } else if (x[ev.x_i] > 0) {
+            // Positive valued elements sweep backwards from zero, negative elements sweep forward from zero,
+            // both will wrap around and end up back at zero
+            int next_qi = ev.new_qi - 1;
+            if (next_qi >= 0) {
+                events[1] = (struct scale_change_event) {
+                    .d      = x[ev.x_i] * inv_midpoints[next_qi],
+                    .x_i    = ev.x_i,
+                    .new_qi = next_qi,
+                };
+            } else {
+                // Wrap around at 0
+                events[1] = (struct scale_change_event) {
+                    .d      = 0,
+                    .x_i    = ev.x_i,
+                    .new_qi = 15,
+                };
+            }
+        } else {
+            // Same as above but negative value
+            int next_qi = ev.new_qi + 1;
+            if (next_qi <= 15) {
+                events[1] = (struct scale_change_event) {
+                    .d      = x[ev.x_i] * inv_midpoints[next_qi-1],
+                    .x_i    = ev.x_i,
+                    .new_qi = next_qi,
+                };
+            } else {
+                // Wrap around at 0
+                events[1] = (struct scale_change_event) {
+                    .d      = 0,
+                    .x_i    = ev.x_i,
+                    .new_qi = 0,
+                };
+            }
+        }
+        // All paths update root element, percolate it down to right position
         heap_percolate_down(events, nevents, 1);
         // Update loop values
         const int old_i = qi[ev.x_i];
