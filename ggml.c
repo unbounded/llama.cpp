@@ -621,10 +621,9 @@ static float find_optimal_scale(const float * restrict x, uint8_t * restrict qi)
     // Start scaling at negative infinity
     float best_score = INFINITY;
     float best_d = 0;
-    int best_i = 0;
-    for (int i = 0; i < QK; i++) {
-        qi[i] = zero_i;
-    }
+    uint8_t best_qi[QK];
+    memset(qi, zero_i, QK);
+    memset(best_qi, zero_i, QK);
 
     for (int i = 0; i < nevents; i++) {
         struct event ev = events[i];
@@ -650,16 +649,11 @@ static float find_optimal_scale(const float * restrict x, uint8_t * restrict qi)
             // solve for minima of d^2*sum(q_i^2) - 2*d*sum(x_i*q_i)
             best_d = x_mul_qv_sum / qv_sqr_sum;
             best_score = local_score;
-            best_i = i;
+            memcpy(best_qi, qi, QK);
         }
     }
     // restore qi values at position i
-    for (int i = 0; i < 16; i++) {
-        qi[i] = zero_i;
-    }
-    for (int i = 0; i <= best_i; i++) {
-        qi[events[i].x_i] = events[i].new_shape_i;
-    }
+    memcpy(qi, best_qi, QK);
 
     return best_d;
 }
