@@ -559,6 +559,62 @@ static int comparefloat(const void * f1p, const void * f2p) {
     return (f1 > f2) - (f1 < f2);
 }
 
+// Each event represents a value of d where one value in x changes its quantization
+typedef struct scale_change_event {
+    float d;
+    uint8_t x_i;
+    uint8_t new_qi;
+} scale_change_event_t;
+
+
+// Move an inserted leaf element up the heap until the heap property is restored
+static void heap_percolate_up(struct scale_change_event * restrict heap, size_t i) {
+    while (i > 1) {
+        const size_t parent_i = i / 2;
+        if (heap[parent_i].d <= heap[i].d) {
+            break;
+        }
+        // Swap with parent
+        struct scale_change_event tmp = heap[i];
+        heap[i] = heap[parent_i];
+        heap[parent_i] = tmp;
+        i = parent_i;
+    }
+}
+
+// Move an inserted root element down until the heap property is restored
+static void heap_percolate_down(struct scale_change_event * restrict heap, size_t heap_size, size_t i) {
+    while (true) {
+        const size_t ci1 = i*2;
+        const size_t ci2 = i*2 + 1;
+        size_t smallest_i = i;
+        if (ci1 > heap_size) {
+            break;
+        }
+        if (heap[ci1].d < heap[smallest_i].d) {
+            smallest_i = ci1;
+        }
+        if (ci2 <= heap_size && heap[ci2].d < heap[smallest_i].d) {
+            smallest_i = ci2;
+        }
+        if (smallest_i == i) {
+            break;
+        }
+        // Swap with smallest child
+        struct scale_change_event tmp = heap[i];
+        heap[i] = heap[smallest_i];
+        heap[smallest_i] = tmp;
+        i = smallest_i;
+    }
+}
+
+// Turn an array of events into a min-heap
+static void heapify(struct scale_change_event * restrict heap, size_t heap_size) {
+    for (size_t i = heap_size/2; i >= 1; i--) {
+        heap_percolate_down(heap, heap_size, i);
+    }
+}
+
 // Find the optimal quantization scaling for a set of values using a sweep line approach
 // Returns the final scaling vale, and writes the quantized indices as bytes to y
 static float find_optimal_scale(const float * restrict x, uint8_t * restrict qi) {
@@ -576,14 +632,11 @@ static float find_optimal_scale(const float * restrict x, uint8_t * restrict qi)
         // find zero index
     };
 
-    // Each event represents a value of d where one value in x changes its quantization
-    struct event {
-        float d;
-        uint8_t x_i;
-        uint8_t new_shape_i;
-    };
     // Each input value will go through each of the 16 quantization values
-    struct event events[16*QK];
+    // This is a heap starting at index 1
+    struct scale_change_event events[16*QK+1];
+    // element 0 is unused - silence compiler warning
+    events[0] = (struct scale_change_event) {0};
     int nevents = 0;
     for (int i = 0; i < QK; i++) {
         if (x[i] == 0.0f) {
@@ -594,22 +647,22 @@ static float find_optimal_scale(const float * restrict x, uint8_t * restrict qi)
             // Positive valued elements sweep backwards from zero, negative elements sweep forward from zero,
             // both will wrap around and end up back at zero
             int forwardi = (x[i] > 0) ? j : j+1;
-            events[nevents++] = (struct event) {
-                .d           = x[i] * inv_midpoints[j],
-                .x_i         = i,
-                .new_shape_i = forwardi,
+            events[1 + nevents++] = (struct scale_change_event) {
+                .d      = x[i] * inv_midpoints[j],
+                .x_i    = i,
+                .new_qi = forwardi,
             };
         }
         // Add a wrap-around event at 0
-        events[nevents++] = (struct event) {
-            .d           = 0,
-            .x_i         = i,
-            .new_shape_i = (x[i] > 0) ? 15 : 0
+        events[1 + nevents++] = (struct scale_change_event) {
+            .d      = 0,
+            .x_i    = i,
+            .new_qi = (x[i] > 0) ? 15 : 0
         };
     }
 
-    // Order the events in increasing order of scaling factor d
-    qsort(events, nevents, sizeof(struct event), comparefloat);
+    // Order the events in increasing order of scaling factor d using a min-heap
+    heapify(events, nevents);
 
     // We will keep track of our sum-of-squared-error score as we loop through the scales, which is
     // sum(x_i^2) + d^2*sum(q_i^2) - 2*d*sum(x_i*q_i)
@@ -625,17 +678,20 @@ static float find_optimal_scale(const float * restrict x, uint8_t * restrict qi)
     memset(qi, zero_i, QK);
     memset(best_qi, zero_i, QK);
 
-    for (int i = 0; i < nevents; i++) {
-        struct event ev = events[i];
+    while (nevents) {
+        struct scale_change_event ev = events[1];
+        // Pop element off heap
+        events[1] = events[nevents--];
+        heap_percolate_down(events, nevents, 1);
         // Update loop values
         const int old_i = qi[ev.x_i];
         const float old_val = shape[old_i];
-        const float new_val = shape[ev.new_shape_i];
+        const float new_val = shape[ev.new_qi];
         qv_sqr_sum -= old_val*old_val;
         qv_sqr_sum += new_val*new_val;
         x_mul_qv_sum -= x[ev.x_i] * old_val;
         x_mul_qv_sum += x[ev.x_i] * new_val;
-        qi[ev.x_i] = ev.new_shape_i;
+        qi[ev.x_i] = ev.new_qi;
 
         if (ev.d == 0.0f || qv_sqr_sum == 0.0f) {
             continue;
