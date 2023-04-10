@@ -581,6 +581,18 @@ typedef struct {
 } block_q4_1;
 static_assert(sizeof(block_q4_1) == sizeof(float) * 2 + QK / 2, "wrong q4_1 block size/padding");
 
+// 5-bit linear scaling quantization
+// blocks of QK elements
+// represented with a 16-bit float magnitude, QK/2 8-bit ints (i.e QK 4-bit unsigned integer factors), and 32 extra bits for lowest bit of each factor.
+typedef struct {
+    ggml_fp16_t d;
+    uint16_t even_lsbs; // Lowest significant bit for elements 0, 2, ...
+    uint16_t odd_lsbs;
+    uint8_t qs[QK / 2]; // nibbles / quants with 4 highest bits of each element
+} block_q5_0;
+static_assert(QK == sizeof(((block_q5_0*)0)->odd_lsbs) * 8 * 2, "q5_0 lsb elements must match block size");
+static_assert(sizeof(block_q5_0) == sizeof(ggml_fp16_t) + sizeof(uint32_t) + QK / 2, "wrong q5_0 block size/padding");
+
 // reference implementation for deterministic creation of model files
 static void quantize_row_q4_0_reference(const float * restrict x, block_q4_0 * restrict y, int k) {
     assert(k % QK == 0);
@@ -1033,6 +1045,50 @@ static void quantize_row_q4_1(const float * restrict x, void * restrict vy, int 
 #endif
 }
 
+static void quantize_row_q5_0_reference(const float * restrict x, void * restrict vy, int k) {
+    assert(k % QK == 0);
+    const int nb = k / QK;
+
+    block_q5_0 * restrict y = vy;
+
+    uint8_t pp[QK/2];
+
+    for (int i = 0; i < nb; i++) {
+        float amax = 0.0f; // absolute max
+        float max = 0.0f; // max
+
+        for (int l = 0; l < QK; l++) {
+            const float v = x[i*QK + l];
+            if (amax < fabsf(v)) {
+                amax = fabs(v);
+                max = v;
+            }
+        }
+
+        const float d = max / -16;
+        const float id = d ? 1.0f/d : 0.0f;
+
+        // TODO: maybe adjust id?
+        y[i].d = GGML_FP32_TO_FP16(d);
+        y[i].even_lsbs = 0;
+        y[i].odd_lsbs = 0;
+
+        for (int l = 0; l < QK; l += 2) {
+            const float v0 = x[i*QK + l + 0]*id;
+            const float v1 = x[i*QK + l + 1]*id;
+
+            const uint8_t vi0 = MIN(31, (int8_t)roundf(v0) + 16);
+            const uint8_t vi1 = MIN(31, (int8_t)roundf(v1) + 16);
+
+            pp[l/2] = (vi0 >> 1) | ((vi1 >> 1) << 4);
+            y[i].even_lsbs |= (vi0 & 1) << (l/2);
+            y[i].odd_lsbs |= (vi1 & 1) << (l/2);
+        }
+
+        memcpy(y[i].qs, pp, sizeof(pp));
+    }
+}
+
 static void dequantize_row_q4_0(const void * restrict vx, float * restrict y, int k) {
     assert(k % QK == 0);
     const int nb = k / QK;
@@ -1255,6 +1311,39 @@ static void dequantize_row_q4_1(const void * restrict vx, float * restrict y, in
         }
     }
 #endif
+}
+
+static void dequantize_row_q5_0(const void * restrict vx, float * restrict y, int k) {
+    assert(k % QK == 0);
+    const int nb = k / QK;
+
+    const block_q5_0 * restrict x = vx;
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        const uint16_t even_lsbs = x[i].even_lsbs;
+        const uint16_t odd_lsbs = x[i].odd_lsbs;
+
+        const uint8_t * restrict pp = x[i].qs;
+
+        for (int l = 0; l < QK; l += 2) {
+            const uint8_t vi = pp[l/2];
+
+            const int8_t vi0 = vi & 0xf;
+            const int8_t vi1 = vi >> 4;
+            const int8_t lsb0 = (even_lsbs >> (l/2)) & 1;
+            const int8_t lsb1 = (odd_lsbs >> (l/2)) & 1;
+
+            const float v0 = ((vi0<<1 | lsb0) - 16)*d;
+            const float v1 = ((vi1<<1 | lsb1) - 16)*d;
+
+            y[i*QK + l + 0] = v0;
+            y[i*QK + l + 1] = v1;
+
+            assert(!isnan(y[i*QK + l + 0]));
+            assert(!isnan(y[i*QK + l + 1]));
+        }
+    }
 }
 
 //
@@ -2408,6 +2497,47 @@ static void ggml_vec_dot_q4_1(const int n, float * restrict s, const void * rest
     *s = sumf;
 }
 
+static void ggml_vec_dot_q5_0(const int n, float * restrict s, const void * restrict vx, const void * restrict vy) {
+    const int nb = n / QK;
+
+    const block_q5_0 * restrict x = vx;
+    const block_q5_0 * restrict y = vy;
+
+    float sumf = 0.0;
+
+    for (int i = 0; i < nb; i++) {
+        const float d0 = GGML_FP16_TO_FP32(x[i].d);
+        const float d1 = GGML_FP16_TO_FP32(y[i].d);
+
+        const uint16_t x_even_lsbs = x[i].even_lsbs;
+        const uint16_t x_odd_lsbs  = x[i].odd_lsbs;
+        const uint16_t y_even_lsbs = y[i].even_lsbs;
+        const uint16_t y_odd_lsbs  = y[i].odd_lsbs;
+
+        const uint8_t * restrict p0 = x[i].qs;
+        const uint8_t * restrict p1 = y[i].qs;
+
+        for (int j = 0; j < QK/2; j++) {
+            const uint8_t v0 = p0[j];
+            const uint8_t v0b0 = (x_even_lsbs >> j) & 1;
+            const uint8_t v0b1 = (x_odd_lsbs >> j) & 1;
+            const uint8_t v1 = p1[j];
+            const uint8_t v1b0 = (y_even_lsbs >> j) & 1;
+            const uint8_t v1b1 = (y_odd_lsbs >> j) & 1;
+
+            const float f0 = d0*((int8_t) ((v0 & 0xf)<<1 | v0b0) - 16);
+            const float f1 = d0*((int8_t) ((v0 >> 4)<<1 | v0b1)  - 16);
+
+            const float f2 = d1*((int8_t) ((v1 & 0xf)<<1 | v1b0) - 16);
+            const float f3 = d1*((int8_t) ((v1 >> 4)<<1 | v1b1)  - 16);
+
+            sumf += f0*f2 + f1*f3;
+        }
+    }
+
+    *s = sumf;
+}
+
 // compute GGML_VEC_DOT_UNROLL dot products at once
 // xs - x row stride in bytes
 inline static void ggml_vec_dot_f16_unroll(const int n, const int xs, float * restrict s, void * restrict xv, ggml_fp16_t * restrict y) {
@@ -2654,22 +2784,24 @@ static const int GGML_BLCK_SIZE[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F16]  = 1,
     [GGML_TYPE_Q4_0] = QK,
     [GGML_TYPE_Q4_1] = QK,
+    [GGML_TYPE_Q5_0] = QK,
     [GGML_TYPE_I8]   = 1,
     [GGML_TYPE_I16]  = 1,
     [GGML_TYPE_I32]  = 1,
 };
-static_assert(GGML_TYPE_COUNT == 7, "GGML_BLCK_SIZE is outdated");
+static_assert(GGML_TYPE_COUNT == 8, "GGML_BLCK_SIZE is outdated");
 
 static const size_t GGML_TYPE_SIZE[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F32]  = sizeof(float),
     [GGML_TYPE_F16]  = sizeof(ggml_fp16_t),
     [GGML_TYPE_Q4_0] = sizeof(block_q4_0),
     [GGML_TYPE_Q4_1] = sizeof(block_q4_1),
+    [GGML_TYPE_Q5_0] = sizeof(block_q5_0),
     [GGML_TYPE_I8]   = sizeof(int8_t),
     [GGML_TYPE_I16]  = sizeof(int16_t),
     [GGML_TYPE_I32]  = sizeof(int32_t),
 };
-static_assert(GGML_TYPE_COUNT == 7, "GGML_TYPE_SIZE is outdated");
+static_assert(GGML_TYPE_COUNT == 8, "GGML_TYPE_SIZE is outdated");
 
 
 static const char * GGML_TYPE_NAME[GGML_TYPE_COUNT] = {
@@ -2677,11 +2809,12 @@ static const char * GGML_TYPE_NAME[GGML_TYPE_COUNT] = {
     [GGML_TYPE_F16]  = "f16",
     [GGML_TYPE_Q4_0] = "q4_0",
     [GGML_TYPE_Q4_1] = "q4_1",
+    [GGML_TYPE_Q5_0] = "q5_0",
     [GGML_TYPE_I8]   = "i8",
     [GGML_TYPE_I16]  = "i16",
     [GGML_TYPE_I32]  = "i32",
 };
-static_assert(GGML_TYPE_COUNT == 7, "GGML_TYPE_NAME is outdated");
+static_assert(GGML_TYPE_COUNT == 8, "GGML_TYPE_NAME is outdated");
 
 static const char * GGML_OP_LABEL[GGML_OP_COUNT] = {
     "NONE",
@@ -3355,10 +3488,8 @@ struct ggml_tensor * ggml_set_i32 (struct ggml_tensor * tensor, int32_t value) {
 
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
-            {
-                GGML_ASSERT(false);
-            } break;
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
             {
                 GGML_ASSERT(false);
             } break;
@@ -3415,10 +3546,8 @@ struct ggml_tensor * ggml_set_f32(struct ggml_tensor * tensor, float value) {
 
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
-            {
-                GGML_ASSERT(false);
-            } break;
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
             {
                 GGML_ASSERT(false);
             } break;
@@ -3469,10 +3598,8 @@ struct ggml_tensor * ggml_set_f32(struct ggml_tensor * tensor, float value) {
 int32_t ggml_get_i32_1d(const struct ggml_tensor * tensor, int i) {
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
-            {
-                GGML_ASSERT(false);
-            } break;
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
             {
                 GGML_ASSERT(false);
             } break;
@@ -3513,10 +3640,8 @@ int32_t ggml_get_i32_1d(const struct ggml_tensor * tensor, int i) {
 void ggml_set_i32_1d(const struct ggml_tensor * tensor, int i, int32_t value) {
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
-            {
-                GGML_ASSERT(false);
-            } break;
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
             {
                 GGML_ASSERT(false);
             } break;
@@ -3555,10 +3680,8 @@ void ggml_set_i32_1d(const struct ggml_tensor * tensor, int i, int32_t value) {
 float ggml_get_f32_1d(const struct ggml_tensor * tensor, int i) {
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
-            {
-                GGML_ASSERT(false);
-            } break;
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
             {
                 GGML_ASSERT(false);
             } break;
@@ -3599,10 +3722,8 @@ float ggml_get_f32_1d(const struct ggml_tensor * tensor, int i) {
 void ggml_set_f32_1d(const struct ggml_tensor * tensor, int i, float value) {
     switch (tensor->type) {
         case GGML_TYPE_Q4_0:
-            {
-                GGML_ASSERT(false);
-            } break;
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
             {
                 GGML_ASSERT(false);
             } break;
@@ -5428,6 +5549,7 @@ static void ggml_compute_forward_dup(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -5509,6 +5631,7 @@ static void ggml_compute_forward_add(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -5561,6 +5684,7 @@ static void ggml_compute_forward_sub(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -5613,6 +5737,7 @@ static void ggml_compute_forward_mul(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -5665,6 +5790,7 @@ static void ggml_compute_forward_div(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -5713,6 +5839,7 @@ static void ggml_compute_forward_sqr(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -5761,6 +5888,7 @@ static void ggml_compute_forward_sqrt(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -5819,6 +5947,7 @@ static void ggml_compute_forward_sum(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -5896,6 +6025,7 @@ static void ggml_compute_forward_mean(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -5960,6 +6090,7 @@ static void ggml_compute_forward_repeat(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -6008,6 +6139,7 @@ static void ggml_compute_forward_abs(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -6056,6 +6188,7 @@ static void ggml_compute_forward_sgn(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -6104,6 +6237,7 @@ static void ggml_compute_forward_neg(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -6152,6 +6286,7 @@ static void ggml_compute_forward_step(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -6200,6 +6335,7 @@ static void ggml_compute_forward_relu(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -6265,6 +6401,7 @@ static void ggml_compute_forward_gelu(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -6332,6 +6469,7 @@ static void ggml_compute_forward_silu(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -6418,6 +6556,7 @@ static void ggml_compute_forward_norm(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -6498,6 +6637,7 @@ static void ggml_compute_forward_rms_norm(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -6907,6 +7047,12 @@ static const quantize_fns_t quantize_fns[GGML_TYPE_COUNT] = {
         .quantize_row_q_reference = (quantize_row_q_t) quantize_row_q4_1_reference,
         .vec_dot_q                = ggml_vec_dot_q4_1,
     },
+    [GGML_TYPE_Q5_0] = {
+        .dequantize_row_q         = dequantize_row_q5_0,
+        .quantize_row_q           = quantize_row_q5_0_reference,
+        .quantize_row_q_reference = (quantize_row_q_t) quantize_row_q5_0_reference,
+        .vec_dot_q                = ggml_vec_dot_q5_0,
+    },
 };
 
 // For internal test use
@@ -7111,6 +7257,7 @@ static void ggml_compute_forward_mul_mat(
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
             {
                 ggml_compute_forward_mul_mat_q_f32(params, src0, src1, dst);
             } break;
@@ -7209,6 +7356,7 @@ static void ggml_compute_forward_scale(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -7374,6 +7522,7 @@ static void ggml_compute_forward_get_rows(
     switch (src0->type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
             {
                 ggml_compute_forward_get_rows_q(params, src0, src1, dst);
             } break;
@@ -7463,6 +7612,7 @@ static void ggml_compute_forward_diag_mask_inf(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -7557,6 +7707,7 @@ static void ggml_compute_forward_soft_max(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -7740,6 +7891,7 @@ static void ggml_compute_forward_rope(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -8008,6 +8160,7 @@ static void ggml_compute_forward_conv_1d_1s(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -8276,6 +8429,7 @@ static void ggml_compute_forward_conv_1d_2s(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -8761,6 +8915,7 @@ static void ggml_compute_forward_flash_attn(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -8972,6 +9127,7 @@ static void ggml_compute_forward_flash_ff(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -9021,6 +9177,7 @@ static void ggml_compute_forward_map_unary(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -9076,6 +9233,7 @@ static void ggml_compute_forward_map_binary(
             } break;
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
         case GGML_TYPE_I8:
         case GGML_TYPE_I16:
         case GGML_TYPE_I32:
@@ -11123,6 +11281,29 @@ size_t ggml_quantize_q4_1(const float * src, void * dst, int n, int k, int64_t *
     }
 
     return (n/QK*sizeof(block_q4_1));
+}
+
+size_t ggml_quantize_q5_0(const float * src, void * dst, int n, int k, int64_t * hist) {
+    assert(k % QK == 0);
+    const int nb = k / QK;
+
+    for (int j = 0; j < n; j += k) {
+        block_q5_0 * restrict y = (block_q5_0 *)dst + j/QK;
+
+        quantize_row_q5_0_reference(src + j, y, k);
+
+        for (int i = 0; i < nb; i++) {
+            for (int l = 0; l < QK; l += 2) {
+                const uint8_t vi0 = (y[i].qs[l/2] & 0xF) << 1 | (y[i].even_lsbs>>(l/2) & 1);
+                const uint8_t vi1 = (y[i].qs[l/2] >> 4) << 1 | (y[i].odd_lsbs>>(l/2) & 1);
+
+                hist[vi0]++;
+                hist[vi1]++;
+            }
+        }
+    }
+
+    return (n/QK*sizeof(block_q5_0));
 }
 
 ////////////////////////////////////////////////////////////////////////////////

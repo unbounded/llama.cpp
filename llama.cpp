@@ -459,6 +459,7 @@ struct llama_file_loader {
                 case GGML_TYPE_F16:
                 case GGML_TYPE_Q4_0:
                 case GGML_TYPE_Q4_1:
+                case GGML_TYPE_Q5_0:
                     break;
                 default: {
                     throw format("unrecognized tensor type %u\n", shard.type);
@@ -531,6 +532,7 @@ struct llama_file_saver {
             case GGML_TYPE_F16:
             case GGML_TYPE_Q4_0:
             case GGML_TYPE_Q4_1:
+            case GGML_TYPE_Q5_0:
                 break;
             default: LLAMA_ASSERT(false);
         }
@@ -818,6 +820,7 @@ static const char *llama_ftype_name(enum llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_Q4_1: return "mostly Q4_1";
         case LLAMA_FTYPE_MOSTLY_Q4_1_SOME_F16:
                                       return "mostly Q4_1, some F16";
+        case LLAMA_FTYPE_MOSTLY_Q5_0: return "mostly Q5_0";
         default:                      return "unknown, may not work";
     }
 }
@@ -1551,6 +1554,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
     switch (ftype) {
         case LLAMA_FTYPE_MOSTLY_Q4_0: quantized_type = GGML_TYPE_Q4_0; break;
         case LLAMA_FTYPE_MOSTLY_Q4_1: quantized_type = GGML_TYPE_Q4_1; break;
+        case LLAMA_FTYPE_MOSTLY_Q5_0: quantized_type = GGML_TYPE_Q5_0; break;
         default: throw format("invalid output file type %d\n", ftype);
     };
 
@@ -1560,7 +1564,8 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
     size_t total_size_org = 0;
     size_t total_size_new = 0;
-    std::vector<int64_t> hist_all(1 << 4, 0);
+    const int vbits = quantized_type == GGML_TYPE_Q5_0 ? 5 : 4;
+    std::vector<int64_t> hist_all(1 << vbits, 0);
 
     size_t idx = 0;
     for (llama_load_tensor & tensor : model_loader->tensors_map.tensors) {
@@ -1613,7 +1618,7 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
 
             work.resize(nelements * 4); // upper bound on size
             new_data = work.addr;
-            std::vector<int64_t> hist_cur(1 << 4, 0);
+            std::vector<int64_t> hist_cur(1 << vbits, 0);
 
             switch (new_type) {
                 case GGML_TYPE_Q4_0:
@@ -1623,6 +1628,10 @@ static void llama_model_quantize_internal(const std::string & fname_inp, const s
                 case GGML_TYPE_Q4_1:
                     {
                         new_size = ggml_quantize_q4_1(f32_data, new_data, nelements, (int) tensor.ne.at(0), hist_cur.data());
+                    } break;
+                case GGML_TYPE_Q5_0:
+                    {
+                        new_size = ggml_quantize_q5_0(f32_data, new_data, nelements, (int) tensor.ne.at(0), hist_cur.data());
                     } break;
                 default:
                     LLAMA_ASSERT(false);

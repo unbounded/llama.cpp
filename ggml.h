@@ -207,6 +207,7 @@ enum ggml_type {
     GGML_TYPE_I8,
     GGML_TYPE_I16,
     GGML_TYPE_I32,
+    GGML_TYPE_Q5_0,
     GGML_TYPE_COUNT,
 };
 
@@ -799,6 +800,7 @@ enum ggml_opt_result ggml_opt(
 
 size_t ggml_quantize_q4_0(const float * src, void * dst, int n, int k, int64_t * hist);
 size_t ggml_quantize_q4_1(const float * src, void * dst, int n, int k, int64_t * hist);
+size_t ggml_quantize_q5_0(const float * src, void * dst, int n, int k, int64_t * hist);
 
 //
 // system info
