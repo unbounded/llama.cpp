@@ -237,7 +237,7 @@ extern "C" {
         GGML_TYPE_Q5_1 = 7,
         GGML_TYPE_Q8_0 = 8,
         GGML_TYPE_Q8_1 = 9,
-        GGML_TYPE_Q4_0C = 10,
+        GGML_TYPE_Q4_2C = 10,
         GGML_TYPE_Q8_0C = 11,
         GGML_TYPE_I8,
         GGML_TYPE_I16,
@@ -871,7 +871,7 @@ extern "C" {
     //
 
     GGML_API size_t ggml_quantize_q4_0(const float * src, void * dst, int n, int k, int64_t * hist);
-    GGML_API size_t ggml_quantize_q4_0c(const float * src, void * dst, int n, int k, int64_t * hist);
+    GGML_API size_t ggml_quantize_q4_2c(const float * src, void * dst, int n, int k, int64_t * hist);
     GGML_API size_t ggml_quantize_q4_1(const float * src, void * dst, int n, int k, int64_t * hist);
     GGML_API size_t ggml_quantize_q4_2(const float * src, void * dst, int n, int k, int64_t * hist);
     GGML_API size_t ggml_quantize_q5_0(const float * src, void * dst, int n, int k, int64_t * hist);
