@@ -3173,15 +3173,16 @@ static void ggml_vec_dot_q4_2c_q8_0c(const int n, float * restrict s, const void
         const int8x16_t v1_1h = vld1q_s8(&yqs[ydst1*QK8_0C + 16]);
 
 #if defined(__ARM_FEATURE_DOTPROD)
-        const int32x4_t p_0 = vdotq_s32(vdupq_n_s32(0), v0_0ls, v1_0l);
-        const int32x4_t p_1 = vdotq_s32(vdupq_n_s32(0), v0_0hs, v1_0h);
-        const int32x4_t p_2 = vdotq_s32(vdupq_n_s32(0), v0_1ls, v1_1l);
-        const int32x4_t p_3 = vdotq_s32(vdupq_n_s32(0), v0_1hs, v1_1h);
+        const float32x4_t xd0123 = vcvt_f32_f16(vreinterpret_f16_f32(vld2_f32((const float *) &xds[xdst0]).val[0]));
 
-        sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p_0), GGML_FP16_TO_FP32(xds[xdst0])*yds[ydst0]);
-        sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p_2), GGML_FP16_TO_FP32(xds[xdst1])*yds[ydst1]);
-        sumv0 = vmlaq_n_f32(sumv0, vcvtq_f32_s32(p_1), GGML_FP16_TO_FP32(xds[xdst0 + 1])*yds[ydst0]);
-        sumv1 = vmlaq_n_f32(sumv1, vcvtq_f32_s32(p_3), GGML_FP16_TO_FP32(xds[xdst1 + 1])*yds[ydst1]);
+        sumv0 = vmlaq_n_f32(sumv0, vaddq_f32(
+                vmulq_laneq_f32(vcvtq_f32_s32(vdotq_s32(vdupq_n_s32(0), v0_0ls, v1_0l)), xd0123, 0),
+                vmulq_laneq_f32(vcvtq_f32_s32(vdotq_s32(vdupq_n_s32(0), v0_0hs, v1_0h)), xd0123, 1)), yds[ydst0]);
+
+        sumv1 = vmlaq_n_f32(sumv1, vaddq_f32(
+                vmulq_laneq_f32(vcvtq_f32_s32(vdotq_s32(vdupq_n_s32(0), v0_1ls, v1_1l)), xd0123, 2),
+                vmulq_laneq_f32(vcvtq_f32_s32(vdotq_s32(vdupq_n_s32(0), v0_1hs, v1_1h)), xd0123, 3)), yds[ydst1]);
+
 #else
         const int16x8_t pl0l = vmull_s8(vget_low_s8 (v0_0ls), vget_low_s8 (v1_0l));
         const int16x8_t pl0h = vmull_s8(vget_high_s8(v0_0ls), vget_high_s8(v1_0l));
